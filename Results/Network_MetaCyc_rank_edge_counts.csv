@@ -1,0 +1,41 @@
+"Pathway","Edges"
+"Aldehyde Degradation",1
+"Amine and Polyamine Biosynthesis",115
+"Amine and Polyamine Degradation",5
+"Amino Acid Biosynthesis",1924
+"Amino Acid Degradation",133
+"Aminoacyl-tRNA Charging",3
+"Aromatic Compound Biosynthesis",182
+"Aromatic Compound Degradation",37
+"C1 Compound Utilization and Assimilation",137
+"Carbohydrate Biosynthesis",406
+"Carbohydrate Degradation",82
+"Carboxylate Degradation",4
+"Cell Structure Biosynthesis",495
+"Cofactor, Prosthetic Group, Electron Carrier, and Vitamin Biosynthesis",1384
+"Fatty Acid and Lipid Biosynthesis",403
+"Fatty Acid and Lipid Degradation",66
+"Fermentation",520
+"Glycan Biosynthesis",5
+"Glycolysis",256
+"Inorganic Nutrient Metabolism",31
+"Metabolic Regulator Biosynthesis",3
+"Nucleic Acid Processing",37
+"Nucleoside and Nucleotide Biosynthesis",1005
+"Nucleoside and Nucleotide Degradation",26
+"Pentose Phosphate Pathways",186
+"Polymeric Compound Degradation",4
+"Respiration",20
+"Secondary Metabolite Biosynthesis",249
+"Secondary Metabolite Degradation",148
+"TCA cycle",57
+"adenosylcobalamin biosynthesis I (anaerobic)",3
+"aspartate superpathway",9
+"glyoxylate cycle",4
+"superpathway of D-glucarate and D-galactarate degradation",5
+"superpathway of S-adenosyl-L-methionine biosynthesis",72
+"superpathway of chorismate metabolism",18
+"superpathway of glycolysis and the Entner-Doudoroff pathway",9
+"superpathway of glycolysis, pyruvate dehydrogenase, TCA, and glyoxylate bypass",5
+"superpathway of hexuronide and hexuronate degradation",72
+"superpathway of histidine, purine, and pyrimidine biosynthesis",5
