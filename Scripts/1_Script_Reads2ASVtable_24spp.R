@@ -1,0 +1,454 @@
+###############################################
+# dada2_runs_subset.R
+# DADA2 pipeline for sequencing runs (subset)
+# Usage:
+# 1) Install cutadapt (see README / instructions)
+# 2) Run in R: source("dada2_runs_subset.R")
+#
+# Author: (Matt)
+###############################################
+
+#------------------------- (0) install packages------------------------------
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+auto_install <- function(pkgs){
+  for(p in pkgs){
+    # Check if the package is already installed
+    if(!requireNamespace(p, quietly = TRUE)){
+      # Use BiocManager for installation (it handles CRAN and Bioc packages)
+      message(paste("Installing:", p))
+      BiocManager::install(p, update = FALSE, ask = FALSE)
+    } else {
+      message(paste(p, "is already installed."))
+    }
+    
+    # Load the package
+    message(paste("Loading:", p))
+    library(p, character.only = TRUE)
+  }
+}
+
+# Install required packages
+auto_install(c("dada2", "ggplot2", "vegan", "ShortRead", "DECIPHER", "phangorn", "Biostrings", "phyloseq", "dplyr", "ape"))
+
+library(dada2)
+library(ShortRead) # for read inspection (optional)
+packageVersion("dada2")
+
+# ---------- USER SETTINGS ----------
+# Paths: relative to working directory (where you run this script)
+name_analysis <- "24spp"
+path_run1 <- "./Amostras_antigas"
+path_run2 <- "./Amostras_novas" # contains files like unique-name_16S-V4V5_R1.fastq (or .fastq.gz)
+silva_tax_file <- ("./silva_nr99_v138.2_toGenus_trainset.fa.gz")
+silva_species_file <- ("./silva_v138.2_assignSpecies.fa.gz")
+outdir <- paste0("dada2_out_", name_analysis)
+dir.create(outdir, showWarnings = FALSE)
+
+# Cutadapt parameters:
+# Primers (exact 5'->3') - from you
+FWD_PRIMER <- "TCGTCGGCAGCGTCAGATGTGTATAAGAGACAGGTGYCAGCMGCCGCGGTAA"
+REV_PRIMER <- "GTCTCGTGGGCTCGGAGATGTGTATAAGAGACAGCCGYCAATTYMTTTRAGTTT"
+# cutadapt options
+cutadapt_path <- "C:/Users/mateu/Downloads/cutadapt.exe"
+cutadapt_err <- 0.12   # -e
+cutadapt_min_overlap <- 12  # -O
+# toggle whether to run cutadapt on run2 as well (TRUE/FALSE)
+cutadapt_on_run2 <- TRUE
+
+# DADA2 processing params (initial; change after QC)
+truncLen_run1 <- c(280, 240)  # initial guess (forward, reverse)
+truncLen_run2 <- c(230, 230)
+maxEE_run1 <- c(2,2)
+maxEE_run2 <- c(2,2)
+truncQ <- 2
+maxN <- 1
+pooling <- FALSE              # set to TRUE or "pseudo" if desired
+# Multithread
+multithread <- TRUE
+
+# ---------- helper: run cutadapt (paired) ----------
+run_cutadapt_pair <- function(inF, inR, outF, outR, fwd_pr, rev_pr,
+                              cutadapt_path, err = 0.12, overlap = 12,
+                              extra_args = NULL) {
+  # Ensure cutadapt exists
+  if(!file.exists(cutadapt_path)) stop("cutadapt executable not found at: ", cutadapt_path)
+  # Build args vector (system2 will handle quoting)
+  args <- c(
+    "-g", fwd_pr,
+    "-G", rev_pr,
+    "-e", as.character(err),
+    "-O", as.character(overlap),
+    "-o", outF,
+    "-p", outR,
+    inF, inR
+  )
+  # add any extra cutadapt args if provided (e.g., "--no-indels" or "--minimum-length 50")
+  if(!is.null(extra_args)) args <- c(args, extra_args)
+  
+  # Run cutadapt and capture both stdout and stderr
+  out <- tryCatch({
+    system2(cutadapt_path, args = args, stdout = TRUE, stderr = TRUE)
+  }, error = function(e){
+    stop("Error running cutadapt: ", conditionMessage(e))
+  })
+  return(out)
+}
+
+# ---------- helper: merge diagnostics ------
+summarize_merge_diagnostics <- function(mergers, out_filt, run_label, outdir) {
+  # 1. Calculate merged counts
+  merged_counts <- sapply(mergers, function(m) {
+    if(is.data.frame(m)) {
+      if("abundance" %in% colnames(m)) return(sum(m$abundance))
+      if("count" %in% colnames(m)) return(sum(m$count))
+    }
+    return(0)
+  })
+  
+  # 2. Extract filtered counts from filterAndTrim output
+  filtered_in <- out_filt[,2]
+  names(filtered_in) <- rownames(out_filt)
+  
+  # 3. Create summary table
+  merged_df <- data.frame(
+    Sample = names(merged_counts),
+    Merged = as.integer(merged_counts),
+    Filtered = as.integer(filtered_in[names(merged_counts)]),
+    stringsAsFactors = FALSE
+  )
+  merged_df$PercentMerged <- round(100 * merged_df$Merged / merged_df$Filtered, 1)
+  
+  # 4. Print Summary to Console
+  cat("\n--- Merge Summary:", run_label, "---\n")
+  print(head(merged_df, 10))
+  cat("Overall Percent Merged:", 
+      round(100 * sum(merged_df$Merged) / sum(merged_df$Filtered), 1), "%\n")
+  
+  # 5. Plot and Save
+  pdf(file.path(outdir, paste0("QC_PercentMerged_", run_label, ".pdf")), width=6, height=5)
+  p <- ggplot(merged_df, aes(x=PercentMerged)) +
+    geom_histogram(binwidth=5, fill="steelblue", color="white") +
+    labs(title=paste("Merge Success:", run_label), x="% Merged", y="Samples") +
+    theme_minimal()
+  print(p)
+  dev.off()
+  
+  return(merged_df)
+}
+
+# ---------- FILE COLLECTION ----------
+# Run1 raw files (pattern: *_R1.fastq or *_R1.fastq.gz)
+fnFs_run1 <- sort(list.files(path_run1, pattern="_R1.fastq.gz", full.names = TRUE, recursive = TRUE))
+fnRs_run1 <- sort(list.files(path_run1, pattern="_R2.fastq.gz", full.names = TRUE, recursive = TRUE))
+if(length(fnFs_run1)==0) stop("No run1 files found in path: ", path_run1)
+fnFs_run2 <- sort(list.files(path_run2, pattern="_R1.fastq.gz", full.names = TRUE))
+fnRs_run2 <- sort(list.files(path_run2, pattern="_R2.fastq.gz", full.names = TRUE))
+if(length(fnFs_run2)==0) stop("No run2 files found in path: ", path_run2)
+
+# Infer sample names by stripping suffix
+sample.names.run1 <- sapply(basename(fnFs_run1), function(x) sub("_16S-V4V5_R1.fastq$|_16S-V4V5_R1.fastq.gz$", "", x))
+sample.names.run2 <- sapply(basename(fnFs_run2), function(x) sub("_16S-V4V5_R1.fastq$|_16S-V4V5_R1.fastq.gz$", "", x))
+
+# Print what will be processed
+cat("Chosen run1 samples:\n"); print(sample.names.run1); print(fnFs_run1)
+cat("Chosen run2 samples:\n"); print(sample.names.run2); print(fnFs_run2)
+
+# ---------- 1) Cutadapt ----------
+cut_path_run1 <- file.path(path_run1, "cutadapt")
+dir.create(cut_path_run1, showWarnings = FALSE)
+cutFs_run1 <- file.path(cut_path_run1, paste0(sample.names.run1, "_R1.cutadapt.fastq.gz"))
+cutRs_run1 <- file.path(cut_path_run1, paste0(sample.names.run1, "_R2.cutadapt.fastq.gz"))
+cut_path_run2 <- file.path(path_run2, "cutadapt")
+dir.create(cut_path_run2, showWarnings = FALSE)
+cutFs_run2 <- file.path(cut_path_run2, paste0(sample.names.run2, "_R1.cutadapt.fastq.gz"))
+cutRs_run2 <- file.path(cut_path_run2, paste0(sample.names.run2, "_R2.cutadapt.fastq.gz"))
+
+# quick check that cutadapt exists
+if(!file.exists(cutadapt_path)) {
+  stop("cutadapt executable not found at: ", cutadapt_path, 
+       "\nEdit cutadapt_path to point to your cutadapt.exe")
+}
+cat("Running cutadapt on run1 (this can take time)...\n")
+for(i in seq_along(fnFs_run1)){
+  cat("cutadapt:", sample.names.run1[i], "\n")
+  res <- run_cutadapt_pair(fnFs_run1[i], fnRs_run1[i], cutFs_run1[i], cutRs_run1[i],
+                           FWD_PRIMER, REV_PRIMER, cutadapt_path,
+                           err = cutadapt_err, overlap = cutadapt_min_overlap)
+  # log results to file (stdout + stderr combined)
+  log_file <- file.path(cut_path_run1, paste0(sample.names.run1[i], "_cutadapt.log"))
+  writeLines(res, con = log_file)
+  cat("cutadapt log written to:", log_file, "\n")
+}
+cat("Running cutadapt on run2 (this can take time)...\n")
+for(i in seq_along(fnFs_run2)){
+  cat("cutadapt:", sample.names.run2[i], "\n")
+  res <- run_cutadapt_pair(fnFs_run2[i], fnRs_run2[i], cutFs_run2[i], cutRs_run2[i],
+                           FWD_PRIMER, REV_PRIMER, cutadapt_path,
+                           err = cutadapt_err, overlap = cutadapt_min_overlap)
+  # log results to file (stdout + stderr combined)
+  log_file <- file.path(cut_path_run2, paste0(sample.names.run2[i], "_cutadapt.log"))
+  writeLines(res, con = log_file)
+  cat("cutadapt log written to:", log_file, "\n")
+}
+
+# ---------- 2) QC plots (inspect) ----------
+pdf(file.path(outdir, "QC_run1_cutadapt.pdf"))
+plotQualityProfile(cutFs_run1[1:min(3, length(cutFs_run1))])
+plotQualityProfile(cutRs_run1[1:min(3, length(cutRs_run1))])
+dev.off()
+pdf(file.path(outdir, "QC_run2_cutadapt.pdf"))
+plotQualityProfile(cutFs_run2[1:min(3, length(cutFs_run2))])
+plotQualityProfile(cutRs_run2[1:min(3, length(cutRs_run2))])
+dev.off()
+
+cat("QC plots written to", outdir, "\n")
+cat("Please inspect these PDFs and adjust truncLen values if needed. Continuing with defaults...\n")
+
+# ---------- 3) filterAndTrim ----------
+filt_path_run1 <- file.path(path_run1, "filtered")
+dir.create(filt_path_run1, showWarnings = FALSE)
+filtFs_run1 <- file.path(filt_path_run1, paste0(sample.names.run1, "_F_filt.fastq.gz"))
+filtRs_run1 <- file.path(filt_path_run1, paste0(sample.names.run1, "_R_filt.fastq.gz"))
+
+cat("Filtering run1 (cutadapt outputs) with filterAndTrim...\n")
+out_filt_run1 <- filterAndTrim(cutFs_run1, filtFs_run1, cutRs_run1, filtRs_run1,
+                               truncLen = truncLen_run1,
+                               maxEE = maxEE_run1,
+                               truncQ = truncQ,
+                               maxN = maxN,
+                               rm.phix = TRUE,
+                               compress = TRUE,
+                               multithread = multithread)
+
+rownames(out_filt_run1) <- sample.names.run1
+
+filt_path_run2 <- file.path(path_run2, "filtered")
+dir.create(filt_path_run2, showWarnings = FALSE)
+filtFs_run2 <- file.path(filt_path_run2, paste0(sample.names.run2, "_F_filt.fastq.gz"))
+filtRs_run2 <- file.path(filt_path_run2, paste0(sample.names.run2, "_R_filt.fastq.gz"))
+
+cat("Filtering run2 (cutadapt outputs) with filterAndTrim...\n")
+out_filt_run2 <- filterAndTrim(cutFs_run2, filtFs_run2, cutRs_run2, filtRs_run2,
+                               truncLen = truncLen_run2,
+                               maxEE = maxEE_run2,
+                               truncQ = truncQ,
+                               maxN = maxN,
+                               rm.phix = TRUE,
+                               compress = TRUE,
+                               multithread = multithread)
+
+rownames(out_filt_run2) <- sample.names.run2
+
+# ---------- 4) Learn errors per run ----------
+cat("Learning errors for run1...\n")
+errF_run1 <- learnErrors(filtFs_run1, multithread = multithread)
+errR_run1 <- learnErrors(filtRs_run1, multithread = multithread)
+cat("Learning errors for run2 paired...\n")
+errF_run2 <- learnErrors(filtFs_run2, multithread = multithread)
+errR_run2 <- learnErrors(filtRs_run2, multithread = multithread)
+
+# Optional: save error plots
+pdf(file.path(outdir, "error_plots_run1.pdf"))
+plotErrors(errF_run1, nominalQ = TRUE)
+plotErrors(errR_run1, nominalQ = TRUE)
+dev.off()
+pdf(file.path(outdir, "error_plots_run2.pdf"))
+plotErrors(errF_run2, nominalQ = TRUE)
+plotErrors(errR_run2, nominalQ = TRUE)
+dev.off()
+
+# ---------- 5) Derep and dada per run ----------
+# Run1 paired
+cat("Derep + dada run1...\n")
+derepFs1 <- derepFastq(filtFs_run1); names(derepFs1) <- sample.names.run1
+derepRs1 <- derepFastq(filtRs_run1); names(derepRs1) <- sample.names.run1
+dadaFs1 <- dada(derepFs1, err = errF_run1, multithread = multithread, pool = pooling)
+dadaRs1 <- dada(derepRs1, err = errR_run1, multithread = multithread, pool = pooling)
+mergers1 <- mergePairs(dadaFs1, derepFs1, dadaRs1, derepRs1, verbose = TRUE)
+cat("Derep + dada run2 paired...\n")
+derepFs2 <- derepFastq(filtFs_run2); names(derepFs2) <- sample.names.run2
+derepRs2 <- derepFastq(filtRs_run2); names(derepRs2) <- sample.names.run2
+dadaFs2 <- dada(derepFs2, err = errF_run2, multithread = multithread, pool = pooling)
+dadaRs2 <- dada(derepRs2, err = errR_run2, multithread = multithread, pool = pooling)
+mergers2 <- mergePairs(dadaFs2, derepFs2, dadaRs2, derepRs2, verbose = TRUE)
+
+# --- merge diagnostics  ---
+# Diagnostics for Run 1
+stats_run1 <- summarize_merge_diagnostics(mergers1, out_filt_run1, "Run1", outdir)
+
+# Diagnostics for Run 2
+stats_run2 <- summarize_merge_diagnostics(mergers2, out_filt_run2, "Run2", outdir)
+# --- end diagnostics ---
+
+# ---------- 5.1) Make sequence table ----------------
+seqtab1 <- makeSequenceTable(mergers1)
+seqtab2 <- makeSequenceTable(mergers2)
+
+# ---------- 6) Merge runs and remove chimeras ----------
+cat("Merging run1 and run2 sequence tables...\n")
+seqtab_all <- mergeSequenceTables(seqtab1, seqtab2)
+
+cat("Total dimensions of merged seqtab (samples x ASVs):\n")
+print(dim(seqtab_all))
+
+cat("Removing chimeras on merged table...\n")
+seqtab_all_nochim <- removeBimeraDenovo(seqtab_all, method = "consensus", multithread = multithread, verbose = TRUE)
+
+cat("Non-chimeric seqtab dimensions:\n"); print(dim(seqtab_all_nochim))
+# ---------- 6.1) Read Tracking Table ----
+# Create diagnostics directory
+diag_dir <- file.path(outdir, "diagnostics")
+dir.create(diag_dir, showWarnings = FALSE)
+
+# Helper to get counts from dada objects
+getN <- function(x) sum(getUniques(x))
+
+# 1. Collect Denoised stats (Post-DADA2, Pre-Merge)
+# Combining both runs for Forward and Reverse
+denoised_F <- c(sapply(dadaFs1, getN), sapply(dadaFs2, getN))
+denoised_R <- c(sapply(dadaRs1, getN), sapply(dadaRs2, getN))
+
+# 2. Collect Merged stats
+merged_counts <- c(sapply(mergers1, getN), sapply(mergers2, getN))
+
+# 3. Build the full dataframe
+# Note: Ensure all_samples order matches the order of the vectors above
+all_samples <- c(sample.names.run1, sample.names.run2)
+out_filt_both <- rbind(out_filt_run1, out_filt_run2)
+
+tracking_detailed <- data.frame(
+  Sample = all_samples,
+  Input = out_filt_both[,1],
+  Filtered = out_filt_both[,2],
+  Denoised_F = denoised_F[all_samples],
+  Denoised_R = denoised_R[all_samples],
+  Merged = merged_counts[all_samples],
+  Nonchim = rowSums(seqtab_all_nochim)[all_samples],
+  stringsAsFactors = FALSE
+)
+
+# 4. Add "Useful Information" (Calculated Percentages)
+tracking_detailed$Perc_Filtered <- round(100 * tracking_detailed$Filtered / tracking_detailed$Input, 1)
+tracking_detailed$Perc_Merged   <- round(100 * tracking_detailed$Merged / tracking_detailed$Filtered, 1)
+tracking_detailed$Perc_Final    <- round(100 * tracking_detailed$Nonchim / tracking_detailed$Input, 1)
+
+# 5. Save and Print
+write.csv(tracking_detailed, file.path(diag_dir, "read_tracking_detailed.csv"), row.names = FALSE)
+
+cat("\n--- Detailed Read Tracking (First 10 Samples) ---\n")
+print(head(tracking_detailed, 10))
+
+# Plots (Plot 2 now uses the corrected Nonchim column)
+pdf(file.path(diag_dir, "diagnostic_plots.pdf"), width=8, height=6)
+# Plot 1 — Merge success
+hist(tracking_detailed$Merged / tracking_detailed$Filtered, main="Percent Merged Reads", xlab="Merged / Filtered")
+# Plot 2 — Non-chimeric reads
+hist(tracking_detailed$Nonchim, main="Non-Chimeric Reads per Sample", xlab="Reads")
+dev.off()
+
+# Rarefaction Curve Plot
+# Convert seqtab matrix to vegan-compatible object
+otu <- (seqtab_all_nochim)
+depth <- rowSums(otu)
+richness <- vegan::specnumber(otu)
+pdf(file.path(diag_dir,"rarefaction_depthcolored.pdf"))
+rarecurve(
+  otu, 
+  step = 200, 
+  label=FALSE,
+  col = colorRampPalette(c("lightblue","darkblue"))(100)[rank(depth)]
+)
+dev.off()
+pdf(file.path(diag_dir,"richness_vs_depth.pdf"))
+plot(depth, richness, 
+     pch=19, 
+     xlab="Sequencing depth",
+     ylab="Observed richness (ASVs)",
+     main="Saturation diagnostic: Richness vs Depth")
+abline(lm(richness ~ depth), col="red")
+dev.off()
+
+cat("\nDiagnostic PDF, tracking table, and rarefaction curves saved in:\n")
+cat(diag_dir, "\n\n")
+
+# ---------- 7) Save outputs (Simplified) ----------
+# write ASV fasta (Sequences as headers)
+asv_seqs <- colnames(seqtab_all_nochim)
+asv_headers <- paste0(">ASV", seq_along(asv_seqs))
+asv_fasta <- c(rbind(asv_headers, asv_seqs))
+writeLines(asv_fasta, file.path(outdir, "ASVs.fa"))
+
+# write count table (ASVs rows x samples columns)
+asv_tab <- t(seqtab_all_nochim)
+colnames(asv_tab) <- rownames(seqtab_all_nochim) # Set sample names
+write.csv(asv_tab, file.path(outdir, "ASV_counts.csv"), quote = FALSE)
+
+# Save seqtab object (The most important R object)
+saveRDS(seqtab_all_nochim, file.path(outdir, "seqtab_all_nochim.rds"))
+
+# Final outputs summary
+cat("Outputs written to", outdir, "\n")
+cat("ASV fasta: ", file.path(outdir, "ASVs.fa"), "\n")
+cat("ASV counts: ", file.path(outdir, "ASV_counts.csv"), "\n")
+cat("Read tracking: ", file.path(outdir, "read_tracking_auto.csv"), "\n")
+cat("RDS seqtab: ", file.path(outdir, "seqtab_all_nochim.rds"), "\n")
+cat("\nDone. Inspect QC plots and tracking table. Then check which samples/libraries lost many reads or need parameter tuning.\n")
+
+
+##assign taxonomy
+
+taxa <- assignTaxonomy(seqtab_all_nochim, silva_tax_file)
+taxa <- addSpecies(taxa, silva_species_file)
+
+# Inspect taxonomic assignment
+taxa.print <- taxa
+rownames(taxa.print) <- NULL
+head(taxa.print)
+# Write original taxonomy table to outdir
+write.csv(taxa, file.path(outdir, "ASV_table_taxonomy_SEQ.csv"), quote = FALSE)
+cat("Original taxonomy table saved to:", file.path(outdir, "ASV_table_taxonomy_SEQ.csv"), "\n")
+
+# --- 2. Create the ASV Map Table ---
+# The ASV sequences are the column names of the sequence table
+ASV_sequences <- colnames(seqtab_all_nochim)
+N_ASVs <- length(ASV_sequences)
+# Create unique ASV IDs (ASV_1, ASV_2, ..., ASV_n)
+ASV_IDs <- paste0("ASV_", seq_len(N_ASVs))
+# Create the map file: Sequence | ASV_ID
+ASV_map <- data.frame(
+  Sequence = ASV_sequences,
+  ASV_ID = ASV_IDs,
+  stringsAsFactors = FALSE
+)
+# Write the ASV map to a file
+write.csv(ASV_map, file.path(outdir, "ASV_sequence_to_ID_map.csv"), row.names = FALSE, quote = FALSE)
+cat("ASV map created and saved to:", file.path(outdir, "ASV_sequence_to_ID_map.csv"), "\n")
+# --- 3. Create New Count Table (ASV IDs) ---
+# Transpose the original sequence table (ASV sequences as row names, Samples as column names)
+ASV_counts_orig <- t(seqtab_all_nochim)
+# Create the new count table
+ASV_counts_new <- ASV_counts_orig
+# Replace the row names (ASV sequences) with the new ASV IDs using the map
+match_indices <- match(rownames(ASV_counts_new), ASV_map$Sequence)
+rownames(ASV_counts_new) <- ASV_map$ASV_ID[match_indices]
+# Write the new ASV count table
+write.csv(ASV_counts_new, file.path(outdir, "ASV_counts_ID.csv"), quote = FALSE)
+cat("ASV count table with IDs saved to:", file.path(outdir, "ASV_counts_ID.csv"), "\n")
+# --- 4. Create New Taxonomy Table (ASV IDs) ---
+# The taxonomy table 'taxa' has ASV sequences as row names
+taxa_new <- taxa
+# Replace the row names (ASV sequences) with the new ASV IDs
+match_indices_taxa <- match(rownames(taxa_new), ASV_map$Sequence)
+rownames(taxa_new) <- ASV_map$ASV_ID[match_indices_taxa]
+# Write the new taxonomy table
+write.csv(data.frame(taxa_new, check.names = FALSE), file.path(outdir, "ASV_table_taxonomy_ID.csv"), quote = FALSE)
+cat("ASV taxonomy table with IDs saved to:", file.path(outdir, "ASV_table_taxonomy_ID.csv"), "\n")
+
+
+
+
+
+
+
