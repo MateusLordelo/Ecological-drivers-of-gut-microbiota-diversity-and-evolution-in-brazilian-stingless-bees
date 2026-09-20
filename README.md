@@ -1,7 +1,7 @@
 # Ecological-drivers-of-gut-microbiota-diversity-and-evolution-in-brazilian-stingless-bees
 Here, we characterized the gut microbiota of 29 species of Brazilian stingless bees collected across four states (Minas Gerais, Espírito Santo, Amazonas, and Pernambuco), encompassing a broad range of ecological traits, nesting behaviors, and management conditions (wild and managed colonies).
 # Gut Microbiota Analyses in Brazilian stingless bees
-[![DOI](https://zenodo.org/badge/1157461999.svg)](https://doi.org/10.5281/zenodo.22864042)
+[![DOI](https://zenodo.org/badge/1157461999.svg)](https://doi.org/10.5281/zenodo.22864094)
 This repository contains all scripts and workflows used for the microbiome analyses described in our manuscript.  
 All analyses were conducted in **R v4.5.1** and rely on a set of specialized packages for sequence processing, diversity analyses, differential abundance testing, functional prediction, and network inference.
 
